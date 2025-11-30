@@ -1,0 +1,13 @@
+[package]
+name = "clipper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-channel = "0.5.15"
+eframe = "0.33.2"
+image = "0.25.9"
+nokhwa = { version="0.10.10", features=["input-native", "output-threaded"] }
+once_cell = "1.21.3"
+anyhow = "*"
+chrono = "0.4.42"
