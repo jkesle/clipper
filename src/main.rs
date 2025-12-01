@@ -17,6 +17,7 @@ mod messages;
 mod camera;
 mod recorder;
 mod app;
+mod audio;
 
 use crossbeam_channel::unbounded;
 use eframe::NativeOptions;

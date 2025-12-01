@@ -45,12 +45,30 @@ pub enum CameraCommand {
     StartStream(VideoConfig)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioDevice {
+    pub name: String,
+    pub index: usize
+}
+
+pub enum AudioMessage {
+    DeviceList(Vec<AudioDevice>),
+    Error(String)
+}
+
+pub enum AudioCommand {
+    SelectDevice(usize),
+    StartRecording(String),
+    StopRecording
+}
+
 pub enum RecorderCommand {
     StartSegment,
     WriteFrame(Arc<Vec<u8>>),
     EndSegment,
     Undo,
     UpdateConfig { width: u32, height: u32, fps: u32, format: String, encoder: EncoderPreset, quality: EncodingQuality, speed: EncodingSpeed },
+    SetAudioDevice(usize),
     FinalizeVideo(String)
 }
 
