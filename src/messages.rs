@@ -14,6 +14,8 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use std::{fmt, sync::Arc, path::PathBuf};
+use crossbeam_channel::Sender;
+
 use crate::recorder::types::{EncoderPreset, EncodingQuality, EncodingSpeed};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,7 +61,7 @@ pub enum AudioMessage {
 pub enum AudioCommand {
     SelectDevice(usize),
     StartRecording(String),
-    StopRecording
+    StopRecording(Sender<()>)
 }
 
 pub enum RecorderCommand {
@@ -75,5 +77,6 @@ pub enum RecorderCommand {
 pub enum RecorderStatus {
     SegmentSaved(PathBuf),
     SegmentDeleted,
-    VideoFinalized(PathBuf)
+    VideoFinalized(PathBuf),
+    Error(String)
 }

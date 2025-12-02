@@ -16,14 +16,14 @@
 pub mod types;
 mod ffmpeg;
 
-use crate::messages::{RecorderCommand, RecorderStatus};
+use crate::messages::{AudioCommand, RecorderCommand, RecorderStatus};
 use types::{EncoderPreset, EncodingQuality, EncodingSpeed};
 use crossbeam_channel::{Receiver, Sender};
 use std::{fs::{self, File}, io::Write, path::PathBuf, process::{Child, Command, Stdio}, thread};
 
-pub fn start_thread(cmd_rx: Receiver<RecorderCommand>, status_tx: Sender<RecorderStatus>) {
+pub fn start_thread(cmd_rx: Receiver<RecorderCommand>, status_tx: Sender<RecorderStatus>, aud_tx: Sender<AudioCommand>) {
     thread::spawn(move || {
-        let mut process: Option<Child> = None;
+        let mut video_process: Option<Child> = None;
         let mut segments: Vec<PathBuf> = Vec::new();
         let mut counter = 0;
         let mut width = 640;
@@ -33,6 +33,8 @@ pub fn start_thread(cmd_rx: Receiver<RecorderCommand>, status_tx: Sender<Recorde
         let mut encoder = EncoderPreset::CPU;
         let mut quality = EncodingQuality::Med;
         let mut speed = EncodingSpeed::Balanced;
+        let temp_vid: &str = "tmp_vid.mp4";
+        let temp_aud: &str = "tmp_aud.mp4";
 
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
@@ -46,26 +48,64 @@ pub fn start_thread(cmd_rx: Receiver<RecorderCommand>, status_tx: Sender<Recorde
                     println!("REC: fmmpeg {}", args.join(" "));
                     let child = Command::new("ffmpeg").args(&args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn();
                     match child {
-                        Ok(c) => process = Some(c),
+                        Ok(c) => video_process = Some(c),
                         Err(e) => eprintln!("FFmpeg error: {}", e)
                     }
 
                     segments.push(PathBuf::from(&filename));
                 },
                 RecorderCommand::WriteFrame(data) => {
-                    if let Some(proc) = &mut process {
+                    if let Some(proc) = &mut video_process {
                         if let Some(stdin) = &mut proc.stdin {
                             let _ = stdin.write_all(&data);
                         }
                     }
                 },
                 RecorderCommand::EndSegment => {
-                    if let Some(mut proc) = process.take() {
-                        let _ = proc.wait();
-                        if let Some(last) = segments.last() {
-                            let _ = status_tx.send(RecorderStatus::SegmentSaved(last.clone()));
+                    if let Some(mut proc) = video_process.take() {
+                        if let Err(e) = proc.wait() {
+                            eprintln!("Recorder warn: FFmpeg wait failed: {}", e);
                         }
                     }
+
+                    let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+                    if let Err(e) = aud_tx.send(AudioCommand::StopRecording(ack_tx)) {
+                        eprintln!("Audio thread unavailable: {}", e);
+                    } else if let Err(_) = ack_rx.recv() {
+                        eprintln!("Audio thread disconnected unexpectedly during pause");
+                    }
+
+                    let finfile = format!("clip_{:03}.mp4", counter);
+                    if !std::path::Path::new(temp_vid).exists() || !std::path::Path::new(temp_aud).exists() {
+                        let _ = status_tx.send(RecorderStatus::Error("Temp files missing, recording failed".into()));
+                        let _ = fs::remove_file(temp_vid);
+                        let _ = fs::remove_file(temp_aud);
+                        continue;
+                    }
+
+                    let merge = Command::new("ffmpeg").args(&[
+                        "-i", temp_vid,
+                        "-i", temp_aud,
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-y", &finfile
+                    ]).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn();
+                    match merge {
+                        Ok(mut child) => {
+                            match child.wait() {
+                                Ok(status) if status.success() => {
+                                    segments.push(PathBuf::from(&finfile));
+                                    let _ = status_tx.send(RecorderStatus::SegmentSaved(PathBuf::from(&finfile)));
+                                },
+                                Ok(_) => { let _ = status_tx.send(RecorderStatus::Error("Merge process returned error code".into())); },
+                                Err(e) => { let _ = status_tx.send(RecorderStatus::Error(format!("Failed to wait on merge: {}", e))); }
+                            }
+                        },
+                        Err(e) => { let _ = status_tx.send(RecorderStatus::Error(format!("FFmpeg merge spawn failed: {}", e))); }
+                    }
+
+                    if let Err(e) = fs::remove_file(temp_vid) { eprintln!("Warn: Failed to delete temporary pre-merge video container: {}", e); }
+                    if let Err(e) = fs::remove_file(temp_aud) { eprintln!("Warn: Failed to delete temporary pre-merge audio container: {}", e); }
                 },
                 RecorderCommand::Undo => {
                     if let Some(path) = segments.pop() {

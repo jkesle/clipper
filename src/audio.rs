@@ -117,7 +117,7 @@ pub fn start_thread(msg_tx: Sender<AudioMessage>, cmd_rx: Receiver<AudioCommand>
                     }
                 },
 
-                AudioCommand::StopRecording => {
+                AudioCommand::StopRecording(ack_tx) => {
                     if let Ok(mut guard) = writer_handle.lock() {
                         if let Some(mut writer) = guard.take() {
                             if let Err(e) = writer.flush() {
@@ -125,6 +125,8 @@ pub fn start_thread(msg_tx: Sender<AudioMessage>, cmd_rx: Receiver<AudioCommand>
                             }
                         }
                     }
+                    
+                    let _ = ack_tx.send(());
                 }
             }
         }
