@@ -13,107 +13,122 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::messages::{CameraCommand, CameraMessage, VideoConfig};
+use crate::messages::{camera::{CameraCommand, CameraMessage}, video::VideoConfig};
 use crossbeam_channel::{Sender, Receiver};
 use image::imageops::FilterType;
 use nokhwa::{Camera, pixel_format::RgbFormat, utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType}};
 use std::{sync::Arc, thread};
 
-pub fn start_camera_thread(tx: Sender<CameraMessage>, cmd_rx: Receiver<CameraCommand>) {
+const MJPEG: &str = "MJPEG";
+const YUYV: &str = "YUYV";
+const NV12: &str = "NV12";
+const GRAY: &str = "GRAY";
+
+pub fn start_thread(tx: Sender<CameraMessage>, cmd_rx: Receiver<CameraCommand>) {
     thread::spawn(move || {
-        let index: CameraIndex = CameraIndex::Index(0);
-        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-        let mut camera = match Camera::new(index.clone(), requested) {
-            Ok(c) => c,
-            Err(e) => {
-                let _= tx.send(CameraMessage::Error(format!("Camera initialization failed: {}", e)));
-                return;
+        loop {
+            let index: CameraIndex = CameraIndex::Index(0);
+            let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+            let query_camera_result = Camera::new(index.clone(), requested);
+            match query_camera_result {
+                Ok(mut camera) => {
+                    match camera.compatible_camera_formats() {
+                        Ok(formats) => {
+                            let mut configs = Vec::new();
+                            for fmt in formats {
+                                let c = VideoConfig {
+                                    width: fmt.resolution().width(),
+                                    height: fmt.resolution().height(),
+                                    fps: fmt.frame_rate(),
+                                    fmt: fmt.format().to_string()
+                                };
+                                if !configs.contains(&c) { configs.push(c); }
+                            }
+                            configs.sort_by(|a, b| b.width.cmp(&a.width).then(b.fps.cmp(&a.fps)));
+                            let _ = tx.send(CameraMessage::Capabilities(configs));
+                        },
+                        Err(e) => {
+                            let _ = tx.send(CameraMessage::Error(format!("Query failed: {}", e)));
+                            if wait_for_retry(&cmd_rx) { continue; } else { break; }
+                        }
+                    }
+                    
+                    drop(camera);
+                },
+                Err(e) => {
+                    let _= tx.send(CameraMessage::Error(format!("Camera initialization failed: {}", e)));
+                    if wait_for_retry(&cmd_rx) { continue; } else { break; }
+                }
+            };
+
+            let cfg = match cmd_rx.recv() {
+                Ok(CameraCommand::StartStream(c)) => c,
+                Ok(CameraCommand::Retry) => continue,
+                Err(_) => break
+            };
+
+            let frame_format = match cfg.fmt.as_str() {
+                MJPEG => FrameFormat::MJPEG,
+                YUYV => FrameFormat::YUYV,
+                _ => FrameFormat::MJPEG
+            };
+            let exact = CameraFormat::new_from(cfg.width, cfg.height, frame_format, cfg.fps);
+            let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(exact));
+            let mut camera = match Camera::new(index, req) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(CameraMessage::Error(format!("Re-init failed: {}", e)));
+                    if wait_for_retry(&cmd_rx) { continue; } else { break; }
+                }
+            };
+
+            if let Err(e) = camera.open_stream() {
+                let _ = tx.send(CameraMessage::Error(format!("Open stream failed: {}", e)));
+                if wait_for_retry(&cmd_rx) { continue; } else { break; }
             }
-        };
 
-        match camera.compatible_camera_formats() {
-            Ok(formats) => {
-                let mut configs = Vec::new();
-                for fmt in formats {
-                    let config = VideoConfig {
-                        width: fmt.resolution().width(),
-                        height: fmt.resolution().height(),
-                        fps: fmt.frame_rate(),
-                        fmt: fmt.format().to_string()
-                    };
+            let real_fps = camera.frame_rate();
+            let _ = tx.send(CameraMessage::StreamStarted(cfg.width, cfg.height, real_fps));
 
-                    if !configs.contains(&config) { configs.push(config); }
+            loop {
+                if let Ok(CameraCommand::Retry) = cmd_rx.try_recv() {
+                    break;
                 }
 
-                configs.sort_by(|a, b| {
-                    b.width.cmp(&a.width).then(b.fps.cmp(&a.fps))
-                });
-
-                let _ = tx.send(CameraMessage::Capabilities(configs));
-            }
-            Err(e) => {
-                let _ = tx.send(CameraMessage::Error(format!("Query caps failed: {}", e)));
-                return;
-            }
-        }
-
-        drop(camera);
-
-        let selected_config = match cmd_rx.recv() {
-            Ok(CameraCommand::StartStream(config)) => config,
-            _ => return
-        };
-
-        let frame_fmt = match selected_config.fmt.as_str() {
-            "MJPEG" => FrameFormat::MJPEG,
-            "YUYV" => FrameFormat::YUYV,
-            "NV12" => FrameFormat::NV12,
-            "GRAY" => FrameFormat::GRAY,
-            _ => FrameFormat::MJPEG
-        };
-
-        let exact_fmt = CameraFormat::new_from(
-            selected_config.width,
-            selected_config.height,
-            frame_fmt,
-            selected_config.fps
-        );
-
-        let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(exact_fmt));
-
-        let mut camera = match Camera::new(index, req) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send(CameraMessage::Error(format!("Reinit failed: {}", e)));
-                return;
-            }
-        };
-
-        if let Err(e) = camera.open_stream() {
-            let _ = tx.send(CameraMessage::Error(format!("Stream open failure: {}", e)));
-            return;
-        }
-
-        println!("Camera started: {}", selected_config);
-
-        loop {
-            if let Ok(frame) = camera.frame() {
-                let raw_data = frame.buffer().to_vec();
-                let raw_arc = Arc::new(raw_data);
-                let raw_for_rec =  raw_arc.clone();
-                if let Ok(decoded) = frame.decode_image::<RgbFormat>() {
-                    let preview = image::imageops::resize(&decoded, 854, 480, FilterType::Nearest);
-                    let p_width = preview.width();
-                    let p_height = preview.height();
-                    let p_data = preview.into_raw();
-                    let _ = tx.send(CameraMessage::Frame {
-                        raw: raw_for_rec,
-                        preview: p_data,
-                        p_width,
-                        p_height
-                    });
+                match camera.frame() {
+                    Ok(frame) => {
+                        let raw_data = frame.buffer().to_vec();
+                        let raw_arc = Arc::new(raw_data);
+                        let raw =  raw_arc.clone();
+                        if let Ok(decoded) = frame.decode_image::<RgbFormat>() {
+                            let preview_img = image::imageops::resize(&decoded, 854, 480, FilterType::Nearest);
+                            let p_width = preview_img.width();
+                            let p_height = preview_img.height();
+                            let preview = preview_img.into_raw();
+                            let _ = tx.send(CameraMessage::Frame {
+                                raw,
+                                preview,
+                                p_width,
+                                p_height
+                            });
+                        }
+                    },
+                    Err(_) => {
+                        let _ = tx.send(CameraMessage::Error("Camera lost".to_string()));
+                        break;
+                    }
                 }
             }
         }
     });
+}
+
+fn wait_for_retry(rx: &Receiver<CameraCommand>) -> bool {
+    loop {
+        match rx.recv() {
+            Ok(CameraCommand::Retry) => return true,
+            Ok(_) => {},
+            Err(_) => return false
+        }
+    }
 }

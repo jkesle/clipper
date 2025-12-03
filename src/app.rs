@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::messages::{CameraCommand, CameraMessage, RecorderCommand, RecorderStatus, VideoConfig};
+use crate::messages::{audio::{AudioDevice, AudioMessage}, camera::{CameraCommand, CameraMessage}, recorder::{RecorderCommand, RecorderStatus}, video::VideoConfig};
 use crate::recorder::types::{EncoderPreset, EncodingQuality, EncodingSpeed};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::{egui, App, Frame};
@@ -31,96 +31,124 @@ pub struct ClipperApp {
     camera_tx: Sender<CameraCommand>,
     rec_tx: Sender<RecorderCommand>,
     rec_status: Receiver<RecorderStatus>,
+    audio_rx: Receiver<AudioMessage>,
     state: AppState,
-    available_formats: Vec<VideoConfig>,
-    selected_format: Option<VideoConfig>,
+    video_configs: Vec<VideoConfig>,
+    selected_video_config: Option<VideoConfig>,
+    audio_devices: Vec<AudioDevice>,
+    selected_audio_device: Option<AudioDevice>,
     selected_encoder: EncoderPreset,
     selected_quality: EncodingQuality,
     selected_speed: EncodingSpeed,
     texture: Option<egui::TextureHandle>,
     is_recording: bool,
     playlist: Vec<String>,
-    last_final_file: Option<String>
+    last_error: Option<String>,
+    final_file: Option<String>
 }
 
 impl ClipperApp {
-    pub fn new(_cc: &eframe::CreationContext, camera_rx: Receiver<CameraMessage>, camera_tx: Sender<CameraCommand>, rec_tx: Sender<RecorderCommand>, rec_status: Receiver<RecorderStatus>) -> Self {
+    pub fn new(_cc: &eframe::CreationContext, camera_rx: Receiver<CameraMessage>, camera_tx: Sender<CameraCommand>, rec_tx: Sender<RecorderCommand>, rec_status: Receiver<RecorderStatus>, audio_rx: Receiver<AudioMessage>) -> Self {
         Self {
             camera_rx,
             camera_tx,
             rec_tx,
             rec_status,
+            audio_rx,
             state: AppState::Loading,
-            available_formats: Vec::new(),
-            selected_format: None,
+            video_configs: Vec::new(),
+            selected_video_config: None,
+            audio_devices: Vec::new(),
+            selected_audio_device: None,
             selected_encoder: EncoderPreset::CPU,
             selected_quality: EncodingQuality::Med,
             selected_speed: EncodingSpeed::Balanced,
             texture: None,
             is_recording: false,
             playlist: Vec::new(),
-            last_final_file: None
+            final_file: None,
+            last_error: None
         }
     }
 }
 
 impl App for ClipperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        // Messages
         while let Ok(msg) = self.camera_rx.try_recv() {
             match msg {
-                CameraMessage::Capabilities(caps) => {
-                    self.available_formats = caps;
-                    if let Some(first) = self.available_formats.first() {
-                        self.selected_format = Some(first.clone());
+                CameraMessage::Capabilities(c) => { self.video_configs = c; self.selected_video_config = self.video_configs.first().cloned(); self.state = AppState::Configuring; },
+                CameraMessage::StreamStarted(w, h, fps) => {
+                    if let Some(cfg) = &self.selected_video_config {
+                        let _ = self.rec_tx.send(RecorderCommand::UpdateConfig {
+                            width: w, height: h, fps, format: cfg.fmt.clone(),
+                            encoder: self.selected_encoder, quality: self.selected_quality, speed: self.selected_speed
+                        });
                     }
-                    
-                    self.state = AppState::Configuring;
                 },
-                CameraMessage::Frame { raw, preview, p_width, p_height} => {
-                    let image = egui::ColorImage::from_rgb([p_width as usize, p_height as usize], &preview);
-                    self.texture = Some(ctx.load_texture("cam", image, Default::default()));
-                    if self.is_recording {
-                        let _ = self.rec_tx.send(RecorderCommand::WriteFrame(raw));
-                    }
-                }
-
-                CameraMessage::Error(e) => { eprintln!("Camera error: {}", e); }
+                CameraMessage::Frame { raw, preview, p_width, p_height } => {
+                    let img = egui::ColorImage::from_rgb([p_width as usize, p_height as usize], &preview);
+                    self.texture = Some(ctx.load_texture("cam", img, Default::default()));
+                    if self.is_recording { let _ = self.rec_tx.send(RecorderCommand::WriteFrame(raw)); }
+                },
+                CameraMessage::Error(e) => self.last_error = Some(format!("Cam: {}", e)),
             }
         }
 
-        while let Ok(status) = self.rec_status.try_recv() {
-            match status {
-                RecorderStatus::SegmentSaved(p) => self.playlist.push(p.to_string_lossy().into()),
-                RecorderStatus::SegmentDeleted => { self.playlist.pop(); },
-                RecorderStatus::VideoFinalized(p) => {
-                    self.playlist.clear();
-                    self.last_final_file = Some(p.to_string_lossy().to_string());
-                }
+        while let Ok(msg) = self.audio_rx.try_recv() {
+            match msg {
+                AudioMessage::DeviceList(l) => { self.audio_devices = l; self.selected_audio_device = self.audio_devices.first().cloned(); },
+                AudioMessage::Error(e) => self.last_error = Some(format!("Audio: {}", e)),
             }
+        }
+
+        while let Ok(stat) = self.rec_status.try_recv() {
+            match stat {
+                RecorderStatus::SegmentSaved(p) => self.playlist.push(p.to_string_lossy().to_string()),
+                RecorderStatus::SegmentDeleted => { self.playlist.pop(); },
+                RecorderStatus::VideoFinalized(p) => { self.playlist.clear(); self.final_file = Some(p.to_string_lossy().to_string()); },
+                RecorderStatus::Error(e) => self.last_error = Some(format!("Rec: {}", e)),
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) && !self.is_recording {
+            self.is_recording = true; self.final_file = None; self.last_error = None;
+            let _ = self.rec_tx.send(RecorderCommand::StartSegment);
+        }
+        if ctx.input(|i| i.key_released(egui::Key::Space)) && self.is_recording {
+            self.is_recording = false;
+            let _ = self.rec_tx.send(RecorderCommand::EndSegment);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) && !self.is_recording {
+             let _ = self.rec_tx.send(RecorderCommand::Undo);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !self.is_recording {
+             let _ = self.rec_tx.send(RecorderCommand::FinalizeVideo("output.mp4".to_string()));
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.state {
                 AppState::Loading => {
                     ui.centered_and_justified(|ui| {
-                        ui.vertical(|ui| {
-                            ui.spinner();
-                            ui.label("Querying camera capabilities...");
+                        ui.vertical_centered(|ui| {
+                            if let Some(err) = &self.last_error {
+                                ui.heading(egui::RichText::new("Camera initialization failed").color(egui::Color32::RED));
+                                ui.label(err);
+                                ui.add_space(10.0);
+                                if ui.button("Retry").clicked() {
+                                    self.last_error = None;
+                                }
+                            } else {
+                                ui.spinner();
+                                ui.label("Querying Camera...");
+                            }
                         });
                     });
                 },
-                AppState::Configuring => {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical(|ui| {
-                            self.show_config(ui);
-                        });
-                    });
-                },
-
-                AppState::Running => self.show_running(ctx, ui)
+                AppState::Configuring => self.show_config(ui),
+                AppState::Running => self.show_running(ui),
             }
         });
-
+        
         ctx.request_repaint();
     }
 }
@@ -129,11 +157,23 @@ impl ClipperApp {
     fn show_config(&mut self, ui: &mut egui::Ui) {
         ui.heading("Configure");
         ui.separator();
-        egui::Grid::new("cfg").show(ui, |ui| {
-            ui.label("Format:");
-            if let Some(sel) = &mut self.selected_format {
-                egui::ComboBox::from_id_salt("fmt").selected_text(sel.to_string()).show_ui(ui, |ui| {
-                    for config in &self.available_formats { ui.selectable_value(sel, config.clone(), config.to_string()); }
+        egui::Grid::new("cfg_grid").show(ui, |ui| {
+            ui.label("Video:");
+            if let Some(sel) = &mut self.selected_video_config {
+                egui::ComboBox::from_id_salt("vid").selected_text(sel.to_string()).show_ui(ui, |ui| {
+                    for config in &self.video_configs { ui.selectable_value(sel, config.clone(), config.to_string()); }
+                });
+            }
+            ui.end_row();
+
+            ui.label("Audio:");
+            if let Some(sel) = &mut self.selected_audio_device {
+                egui::ComboBox::from_id_salt("aud").selected_text(&sel.name).show_ui(ui, |ui| {
+                    for device in &self.audio_devices {
+                        if ui.selectable_value(sel, device.clone(), &device.name).clicked() {
+                            let _ = self.rec_tx.send(RecorderCommand::SetAudioDevice(device.index));
+                        }
+                    }
                 });
             }
             ui.end_row();
@@ -164,8 +204,9 @@ impl ClipperApp {
             ui.end_row();
         });
 
+        ui.add_space(20.0);
         if ui.button("Confirm").clicked() {
-            if let Some(cfg) = &self.selected_format {
+            if let Some(cfg) = &self.selected_video_config {
                 let _ = self.camera_tx.send(CameraCommand::StartStream(cfg.clone()));
                 let _ = self.rec_tx.send(RecorderCommand::UpdateConfig {
                     width: cfg.width, height: cfg.height, fps: cfg.fps, format: cfg.fmt.clone(), encoder: self.selected_encoder, quality: self.selected_quality, speed: self.selected_speed
@@ -175,43 +216,26 @@ impl ClipperApp {
         }
     }
 
-    fn show_running(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+    fn show_running(&mut self, ui: &mut egui::Ui) {
         if let Some(tex) = &self.texture {
             ui.add(egui::Image::new(tex).fit_to_exact_size(ui.available_size()));
         }
 
-        if self.is_recording { 
-            ui.put(
-                egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(200.0, 50.0)),
-                |ui: &mut egui::Ui| ui.heading(egui::RichText::new("RECORDING").color(egui::Color32::RED).strong())
-            );
+        if self.is_recording {
+            ui.put(egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(200.0, 50.0)),
+                   |ui: &mut egui::Ui| ui.heading(egui::RichText::new("REC").color(egui::Color32::RED).strong()));
         }
 
-        ui.put(
-            egui::Rect::from_min_size(egui::pos2(20.0, ui.available_height() - 50.0), egui::vec2(300.0, 50.0)),
-            |ui: &mut egui::Ui| ui.colored_label(egui::Color32::WHITE, format!("Clips: {}", self.playlist.len()))
-        );
-
-        if let Some(file) = &self.last_final_file {
-            ui.centered_and_justified(|ui| {
-                ui.colored_label(egui::Color32::GREEN, format!("Saved: {}", file));
-            });
+        ui.put(egui::Rect::from_min_size(egui::pos2(20.0, ui.available_height() - 50.0), egui::vec2(300.0, 50.0)),
+               |ui: &mut egui::Ui| ui.colored_label(egui::Color32::WHITE, format!("Clips: {}", self.playlist.len())));
+        
+        if let Some(f) = &self.final_file {
+            ui.centered_and_justified(|ui| ui.colored_label(egui::Color32::GREEN, format!("Saved: {}", f)));
         }
 
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) && !self.is_recording {
-            self.is_recording = true;
-            self.last_final_file = None;
-            let _ = self.rec_tx.send(RecorderCommand::StartSegment);
-        }
-        if ctx.input(|i| i.key_released(egui::Key::Space)) && self.is_recording {
-            self.is_recording = false;
-            let _ = self.rec_tx.send(RecorderCommand::EndSegment);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) && !self.is_recording {
-            let _ = self.rec_tx.send(RecorderCommand::Undo);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !self.is_recording {
-            let _ = self.rec_tx.send(RecorderCommand::FinalizeVideo(format!("output_{}.mp4", Local::now().format("%Y-%m-%d_%H%M%S%.3f").to_string())));
+        if let Some(e) = &self.last_error {
+            ui.put(egui::Rect::from_min_size(egui::pos2(20.0, ui.available_height() - 100.0), egui::vec2(400.0, 40.0)),
+               |ui: &mut egui::Ui| ui.colored_label(egui::Color32::RED, format!("{}", e)));
         }
     }
 }

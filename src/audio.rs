@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::{audio, messages::{AudioCommand, AudioDevice, AudioMessage}};
+use crate::{messages::audio::{AudioCommand, AudioDevice, AudioMessage}};
 use crossbeam_channel::{Receiver, Sender};
 use cpal::{StreamError, traits::{DeviceTrait, HostTrait, StreamTrait}};
 use std::{thread, sync::{Arc, Mutex}};
@@ -35,7 +35,7 @@ pub fn start_thread(msg_tx: Sender<AudioMessage>, cmd_rx: Receiver<AudioCommand>
                 index: i
             }
         }).collect();
-
+        
         if msg_tx.send(AudioMessage::DeviceList(device_list)).is_err() {
             return;
         }
@@ -119,13 +119,13 @@ pub fn start_thread(msg_tx: Sender<AudioMessage>, cmd_rx: Receiver<AudioCommand>
 
                 AudioCommand::StopRecording(ack_tx) => {
                     if let Ok(mut guard) = writer_handle.lock() {
-                        if let Some(mut writer) = guard.take() {
-                            if let Err(e) = writer.flush() {
-                                let _ = msg_tx.send(AudioMessage::Error(format!("Failed to flush audio to disk: {}", e)));
-                            }
+                        if let Some(mut writer) = guard.take() { 
+                            if let Err(e) = writer.flush() { 
+                                let _ = msg_tx.send(AudioMessage::Error(format!("Failed to flush audio to disk: {}", e))); 
+                            } 
                         }
                     }
-                    
+
                     let _ = ack_tx.send(());
                 }
             }
