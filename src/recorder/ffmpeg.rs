@@ -18,6 +18,8 @@ use super::types::{EncoderPreset, EncodingQuality, EncodingSpeed};
 pub fn build_cmd(width: u32, height: u32, fps: u32, format: &str, encoder: EncoderPreset, quality: EncodingQuality, speed: EncodingSpeed, filename: &str) -> Vec<String> {
     let f = String::from("-f");
     let framerate = String::from("-framerate");
+    let pxformat = String::from("-pixel_format");
+    let vidsize = String::from("-video_size");
     let fpstr = fps.to_string();
     let i = String::from("-i");
     let dash = String::from("-");
@@ -28,10 +30,24 @@ pub fn build_cmd(width: u32, height: u32, fps: u32, format: &str, encoder: Encod
             framerate, fpstr,
             i, dash
         ],
+        "YUYV" => vec![
+            f, String::from("rawvideo"),
+            pxformat, String::from("yuyv422"),
+            vidsize, format!("{}x{}", width, height),
+            framerate, fpstr,
+            i, dash
+        ],
+        "NV12" => vec![
+            f, String::from("rawvideo"),
+            pxformat, String::from("nv12"),
+            vidsize, format!("{}x{}", width, height),
+            framerate, fpstr,
+            i, dash
+        ],
         _ => vec![
             f, String::from("rawvideo"),
-            String::from("-pixel_format"), if format == "YUYV" { "yuyv422" } else { "rgb24" }.to_string(),
-            String::from("-video_size"), format!("{}x{}", width, height),
+            pxformat, "rgb24".to_string(),
+            vidsize, format!("{}x{}", width, height),
             framerate, fpstr,
             i, dash
         ]
@@ -51,7 +67,7 @@ pub fn build_cmd(width: u32, height: u32, fps: u32, format: &str, encoder: Encod
                 EncodingQuality::Low => "28"
             };
 
-            vec!["-c:v", "libx264", "-pix_fmt", "yuv420p",
+            vec!["-c:v", "libx264", "-vf", "format=yuv420p",
                 "-preset", preset, "-crf", crf, "-tune", "zerolatency"]
         },
         
@@ -68,12 +84,11 @@ pub fn build_cmd(width: u32, height: u32, fps: u32, format: &str, encoder: Encod
                 EncodingQuality::Low => "28"
             };
 
-            vec!["-c:v", "h264_nvenc", "-pix_fmt", "yuv420p",
+            vec!["-c:v", "h264_nvenc", "-vf", "format=yuv420p",
                 "-preset", preset, "-rc:v", "vbr", "-cq", cq]
         },
-
-        EncoderPreset::AMD => vec!["-c:v", "h264_amf", "-usage", "transcoding"],
-        EncoderPreset::INTEL => vec!["-c:v", "h264_qsv", "-preset", "medium"]
+        EncoderPreset::AMD => vec!["-c:v", "h264_amf", "-vf", "format=yuv420p", "-usage", "transcoding"],
+        EncoderPreset::INTEL => vec!["-c:v", "h264_qsv", "-vf", "format=nv12", "-preset", "medium"]
     };
 
     for arg in enc_args { args.push(arg.to_string()); }

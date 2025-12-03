@@ -11,3 +11,5 @@ nokhwa = { version="0.10.10", features=["input-native", "output-threaded"] }
 once_cell = "1.21.3"
 anyhow = "*"
 chrono = "0.4.42"
+cpal = "0.16.0"
+hound = "3.5.1"
