@@ -73,6 +73,7 @@ pub fn start_thread(tx: Sender<CameraMessage>, cmd_rx: Receiver<CameraCommand>) 
                 _ => FrameFormat::MJPEG
             };
             let exact = CameraFormat::new_from(cfg.width, cfg.height, frame_format, cfg.fps);
+            println!("camera line 76) cfg.fps: {}", cfg.fps.to_string());
             let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(exact));
             let mut camera = match Camera::new(index, req) {
                 Ok(c) => c,
@@ -87,8 +88,7 @@ pub fn start_thread(tx: Sender<CameraMessage>, cmd_rx: Receiver<CameraCommand>) 
                 if wait_for_retry(&cmd_rx) { continue; } else { break; }
             }
 
-            let real_fps = camera.frame_rate();
-            let _ = tx.send(CameraMessage::StreamStarted(cfg.width, cfg.height, real_fps));
+            let _ = tx.send(CameraMessage::StreamStarted(cfg.width, cfg.height, cfg.fps));
 
             loop {
                 if let Ok(CameraCommand::Retry) = cmd_rx.try_recv() {
