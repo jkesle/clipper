@@ -13,18 +13,20 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::messages::{camera::{CameraCommand, CameraMessage}, video::VideoConfig};
+use crate::messages::{camera::{CameraCommand, CameraMessage}, recorder::RecorderCommand, video::VideoConfig};
 use crossbeam_channel::{Sender, Receiver};
 use image::imageops::FilterType;
 use nokhwa::{Camera, pixel_format::RgbFormat, utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType}};
-use std::{sync::Arc, thread};
+use std::{sync::{Arc, Mutex}, thread, time::{Duration, Instant}};
 
 const MJPEG: &str = "MJPEG";
 const YUYV: &str = "YUYV";
 const NV12: &str = "NV12";
 const GRAY: &str = "GRAY";
+const W480p: u32 = 854;
+const H480p: u32 = 480;
 
-pub fn start_thread(tx: Sender<CameraMessage>, cmd_rx: Receiver<CameraCommand>) {
+pub fn start_thread(tx: Sender<CameraMessage>, rec_tx: Sender<RecorderCommand>, cmd_rx: Receiver<CameraCommand>) {
     thread::spawn(move || {
         loop {
             let index: CameraIndex = CameraIndex::Index(0);
@@ -89,34 +91,60 @@ pub fn start_thread(tx: Sender<CameraMessage>, cmd_rx: Receiver<CameraCommand>) 
             }
 
             let _ = tx.send(CameraMessage::StreamStarted(cfg.width, cfg.height, cfg.fps));
+            let latest_frame: Arc<Mutex<Option<Arc<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+            let cap_frame_storage = latest_frame.clone();
+            let ui_tx = tx.clone();
+
+            thread::spawn(move || {
+                loop {
+                    match camera.frame() {
+                        Ok(frame) => {
+                            let raw_data = frame.buffer().to_vec();
+                            let raw_arc = Arc::new(raw_data);
+                            if let Ok(mut guard) = cap_frame_storage.lock() {
+                                *guard = Some(raw_arc.clone());
+                            }
+
+                            if let Ok(decoded) = frame.decode_image::<RgbFormat>() {
+                                let preview = image::imageops::resize(&decoded, W480p, H480p, FilterType::Nearest);
+                                let p_width = preview.width();
+                                let p_height = preview.height();
+                                let preview = preview.into_raw();
+                                let raw: Arc<Vec<u8>> = Arc::new(vec![]);
+                                let _ = ui_tx.send(CameraMessage::Frame {
+                                    raw,
+                                    preview,
+                                    p_width,
+                                    p_height
+                                });
+                            }
+                        },
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+            });
+
+            let target_interval = Duration::from_secs_f64(1.0/cfg.fps as f64);
+            let mut next_tick = Instant::now();
 
             loop {
-                if let Ok(CameraCommand::Retry) = cmd_rx.try_recv() {
-                    break;
+                let frame_to_send = {
+                    let guard = latest_frame.lock().unwrap();
+                    guard.clone()
+                };
+
+                if let Some(data) = frame_to_send {
+                    let _ = rec_tx.send(RecorderCommand::WriteFrame(data));
                 }
 
-                match camera.frame() {
-                    Ok(frame) => {
-                        let raw_data = frame.buffer().to_vec();
-                        let raw_arc = Arc::new(raw_data);
-                        let raw =  raw_arc.clone();
-                        if let Ok(decoded) = frame.decode_image::<RgbFormat>() {
-                            let preview_img = image::imageops::resize(&decoded, 854, 480, FilterType::Nearest);
-                            let p_width = preview_img.width();
-                            let p_height = preview_img.height();
-                            let preview = preview_img.into_raw();
-                            let _ = tx.send(CameraMessage::Frame {
-                                raw,
-                                preview,
-                                p_width,
-                                p_height
-                            });
-                        }
-                    },
-                    Err(_) => {
-                        let _ = tx.send(CameraMessage::Error("Camera lost".to_string()));
-                        break;
-                    }
+                next_tick += target_interval;
+                let now = Instant::now();
+                if next_tick > now {
+                    thread::sleep(next_tick - now);
+                } else {
+                    next_tick = now;
                 }
             }
         }

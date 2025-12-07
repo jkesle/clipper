@@ -86,10 +86,9 @@ impl App for ClipperApp {
                         });
                     }
                 },
-                CameraMessage::Frame { raw, preview, p_width, p_height } => {
+                CameraMessage::Frame { raw: _, preview, p_width, p_height } => {
                     let img = egui::ColorImage::from_rgb([p_width as usize, p_height as usize], &preview);
                     self.texture = Some(ctx.load_texture("cam", img, Default::default()));
-                    if self.is_recording { let _ = self.rec_tx.send(RecorderCommand::WriteFrame(raw)); }
                 },
                 CameraMessage::Error(e) => self.last_error = Some(format!("Cam: {}", e)),
             }

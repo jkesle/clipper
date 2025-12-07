@@ -29,7 +29,7 @@ fn main() -> eframe::Result<()> {
     let (rec_status_tx, rec_status_rx) = unbounded();
     let (audio_message_tx, audio_message_rx) = unbounded();
 
-    camera::start_thread(cam_tx, cam_command_rx);
+    camera::start_thread(cam_tx, rec_command_tx.clone(),  cam_command_rx);
     recorder::start_thread(rec_command_rx, rec_status_tx, audio_command_tx);
     audio::start_thread(audio_message_tx, audio_command_rx);
 
