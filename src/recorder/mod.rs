@@ -16,10 +16,10 @@
 pub mod types;
 mod ffmpeg;
 
-use crate::messages::{audio::AudioCommand, recorder::{RecorderCommand, RecorderStatus}};
+use crate::{messages::{audio::AudioCommand, recorder::{RecorderCommand, RecorderStatus}}, recorder::ffmpeg::get_video_duration};
 use types::{EncoderPreset, EncodingQuality, EncodingSpeed};
 use crossbeam_channel::{Receiver, Sender};
-use std::{fs::{self, File}, io::Write, path::PathBuf, process::{Child, Command, Stdio}, thread};
+use std::{fs::{self, File}, io::Write, path::PathBuf, process::{Child, Command, Stdio}, thread, time::Instant};
 
 pub fn start_thread(cmd_rx: Receiver<RecorderCommand>, status_tx: Sender<RecorderStatus>, aud_tx: Sender<AudioCommand>) {
     thread::spawn(move || {
@@ -36,6 +36,11 @@ pub fn start_thread(cmd_rx: Receiver<RecorderCommand>, status_tx: Sender<Recorde
         let temp_vid: &str = "tmp_vid.mp4";
         let temp_aud: &str = "tmp_aud.mp4";
 
+        let mut clip_start_time = Instant::now();
+        let mut waiting_for_first_frame = false;
+        let mut frames_written: u64 = 0;
+        let mut last_frame_data: Option<Vec<u8>> = None;
+
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
                 RecorderCommand::UpdateConfig {width: w, height: h, fps: f, format: fmt, encoder: enc, quality: qty, speed: spd } => {
@@ -49,22 +54,57 @@ pub fn start_thread(cmd_rx: Receiver<RecorderCommand>, status_tx: Sender<Recorde
                 },
                 RecorderCommand::StartSegment => {
                     counter += 1;
-                    let _ = aud_tx.send(AudioCommand::StartRecording(String::from(temp_aud)));
+                    frames_written = 0;
+                    last_frame_data = None;
                     let args = ffmpeg::build_cmd(width, height, fps, &format, encoder, quality, speed, temp_vid);
                     let child = Command::new("ffmpeg").args(&args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn();
                     match child {
-                        Ok(c) => video_process = Some(c),
+                        Ok(c) => {
+                            video_process = Some(c);
+                            clip_start_time = Instant::now();
+                            waiting_for_first_frame = true;
+                        },
                         Err(e) => { let _ = status_tx.send(RecorderStatus::Error(format!("Failed to spawn ffmpeg: {}", e))); }
                     }
+
+                    let _ = aud_tx.send(AudioCommand::StartRecording(String::from(temp_aud)));
                 },
-                RecorderCommand::WriteFrame(data) => {
+                RecorderCommand::WriteFrame(data, capture_time) => {
+                    if capture_time < clip_start_time { continue; }
                     if let Some(proc) = &mut video_process {
+                        if waiting_for_first_frame {
+                            let _ = aud_tx.send(AudioCommand::StartRecording(temp_aud.to_string()));
+                            clip_start_time = Instant::now();
+                            waiting_for_first_frame = false;
+                        }
                         if let Some(stdin) = &mut proc.stdin {
-                            let _ = stdin.write_all(&data);
+                            if stdin.write_all(&data).is_ok() {
+                                frames_written += 1;
+                                last_frame_data = Some((*data).clone())
+                            }
                         }
                     }
                 },
                 RecorderCommand::EndSegment => {
+                    waiting_for_first_frame = false;
+                    let duration_secs = clip_start_time.elapsed().as_secs_f64();
+                    let expected_frames  = (duration_secs * fps as f64).round() as u64;
+                    if let Some(proc) = &mut video_process {
+                        if let Some(stdin) = &mut proc.stdin {
+                            if frames_written < expected_frames {
+                                let missing = expected_frames - frames_written;
+                                if missing > 0 {
+                                    println!("Sync: padding");
+                                    if let Some(last_data) = &last_frame_data {
+                                        for _ in 0..missing {
+                                            let _ = stdin.write_all(last_data);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(mut proc) = video_process.take() {
                         if let Err(e) = proc.wait() {
                             eprintln!("Video process wait error: {}", e);
@@ -98,7 +138,33 @@ pub fn start_thread(cmd_rx: Receiver<RecorderCommand>, status_tx: Sender<Recorde
                     match merge {
                         Ok(s) if s.success() => {
                             segments.push(PathBuf::from(&finfile));
-                            let _ = status_tx.send(RecorderStatus::SegmentSaved(PathBuf::from(&finfile)));
+                            let final_path = PathBuf::from(&finfile);
+                            let thumb_path = PathBuf::from(format!("thumb_{:03}.jpg", counter));
+                            let preview_path = PathBuf::from(format!("preview_{:03}.gif", counter));
+
+                            let _ = Command::new("ffmpeg").args(&[
+                                "-i", &finfile,
+                                "-ss", "00:00:00.000",
+                                "-vframes", "1",
+                                "-vf", "scale=200:-1",
+                                "-y", thumb_path.to_str().unwrap()
+                            ]).output();
+
+                            let _ = Command::new("ffmpeg").args(&[
+                                "-i", &finfile,
+                                "-vf", "fps=5,scale=160:-1:flags=lanczos",
+                                "-f", "gif",
+                                "-y", preview_path.to_str().unwrap()
+                            ]).output();
+
+                            let clip = crate::messages::recorder::ClipInfo {
+                                video_path: final_path.clone(),
+                                thumb_path,
+                                preview_path,
+                                duration: get_video_duration(&final_path)
+                            };
+
+                            let _ = status_tx.send(RecorderStatus::SegmentSaved(clip));
                             let _ = fs::remove_file(temp_vid);
                             let _ = fs::remove_file(temp_aud);
                         },
@@ -114,11 +180,11 @@ pub fn start_thread(cmd_rx: Receiver<RecorderCommand>, status_tx: Sender<Recorde
                         let _ = status_tx.send(RecorderStatus::SegmentDeleted);
                     }
                 },
-                RecorderCommand::FinalizeVideo(outfile) => {
-                    if segments.is_empty() { continue; }
+                RecorderCommand::FinalizeVideo(ordered_files, output_filename) => {
+                    if ordered_files.is_empty() { continue; }
                     let list_file = "concat_list.txt";
                     if let Ok(mut f) = fs::File::create(list_file) {
-                        for seg in &segments {
+                        for seg in &ordered_files {
                             let _ = writeln!(f, "file '{}'", seg.to_string_lossy());
                         }
                     }
@@ -128,11 +194,11 @@ pub fn start_thread(cmd_rx: Receiver<RecorderCommand>, status_tx: Sender<Recorde
                         "-safe", "0", 
                         "-i", list_file, 
                         "-c", "copy", 
-                        "-y", &outfile
+                        "-y", &output_filename
                         ]).stdout(Stdio::null()).stderr(Stdio::inherit()).status();
                     match status {
                         Ok(s) if s.success() => {
-                            let _ = status_tx.send(RecorderStatus::VideoFinalized(PathBuf::from(&outfile)));
+                            let _ = status_tx.send(RecorderStatus::VideoFinalized(PathBuf::from(&output_filename)));
                             let _ = fs::remove_file(list_file);
                             for seg in &segments { let _ = fs::remove_file(seg); }
                             segments.clear();

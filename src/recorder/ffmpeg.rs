@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use std::{path::PathBuf, process::Command};
+
 use super::types::{EncoderPreset, EncodingQuality, EncodingSpeed};
 
 pub fn build_cmd(width: u32, height: u32, fps: u32, format: &str, encoder: EncoderPreset, quality: EncodingQuality, speed: EncodingSpeed, filename: &str) -> Vec<String> {
@@ -95,4 +97,21 @@ pub fn build_cmd(width: u32, height: u32, fps: u32, format: &str, encoder: Encod
     args.push(String::from("-y"));
     args.push(filename.to_string());
     args
+}
+
+pub fn get_video_duration(path: &PathBuf) -> f64 {
+    let output = Command::new("ffprobe").args(&[
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path.to_str().unwrap()
+    ]).output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.trim().parse::<f64>().unwrap_or(0.0)
+        },
+        _ => 0.0
+    }
 }

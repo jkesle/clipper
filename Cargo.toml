@@ -13,3 +13,5 @@ anyhow = "*"
 chrono = "0.4.42"
 cpal = "0.16.0"
 hound = "3.5.1"
+egui_extras = { version = "0.33.3", features = ["all_loaders"]}
+rfd = "0.16.0"

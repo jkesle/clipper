@@ -136,7 +136,8 @@ pub fn start_thread(tx: Sender<CameraMessage>, rec_tx: Sender<RecorderCommand>, 
                 };
 
                 if let Some(data) = frame_to_send {
-                    let _ = rec_tx.send(RecorderCommand::WriteFrame(data));
+                    let capture_time = Instant::now();
+                    let _ = rec_tx.send(RecorderCommand::WriteFrame(data, capture_time));
                 }
 
                 next_tick += target_interval;

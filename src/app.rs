@@ -13,11 +13,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::messages::{audio::{AudioDevice, AudioMessage}, camera::{CameraCommand, CameraMessage}, recorder::{RecorderCommand, RecorderStatus}, video::VideoConfig};
+use std::path::PathBuf;
+
+use crate::messages::{audio::{AudioDevice, AudioMessage}, camera::{CameraCommand, CameraMessage}, recorder::{ClipInfo, RecorderCommand, RecorderStatus}, video::VideoConfig};
 use crate::recorder::types::{EncoderPreset, EncodingQuality, EncodingSpeed};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::{egui, App, Frame};
 use chrono::Local;
+use egui_extras::install_image_loaders;
 
 #[derive(PartialEq)]
 enum AppState {
@@ -42,13 +45,15 @@ pub struct ClipperApp {
     selected_speed: EncodingSpeed,
     texture: Option<egui::TextureHandle>,
     is_recording: bool,
-    playlist: Vec<String>,
+    playlist: Vec<ClipInfo>,
     last_error: Option<String>,
-    final_file: Option<String>
+    final_file: Option<String>,
+    dragged_item: Option<usize>,
 }
 
 impl ClipperApp {
     pub fn new(_cc: &eframe::CreationContext, camera_rx: Receiver<CameraMessage>, camera_tx: Sender<CameraCommand>, rec_tx: Sender<RecorderCommand>, rec_status: Receiver<RecorderStatus>, audio_rx: Receiver<AudioMessage>) -> Self {
+        egui_extras::install_image_loaders(&_cc.egui_ctx);
         Self {
             camera_rx,
             camera_tx,
@@ -67,6 +72,7 @@ impl ClipperApp {
             is_recording: false,
             playlist: Vec::new(),
             final_file: None,
+            dragged_item: None,
             last_error: None
         }
     }
@@ -74,7 +80,6 @@ impl ClipperApp {
 
 impl App for ClipperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
-        // Messages
         while let Ok(msg) = self.camera_rx.try_recv() {
             match msg {
                 CameraMessage::Capabilities(c) => { self.video_configs = c; self.selected_video_config = self.video_configs.first().cloned(); self.state = AppState::Configuring; },
@@ -103,7 +108,7 @@ impl App for ClipperApp {
 
         while let Ok(stat) = self.rec_status.try_recv() {
             match stat {
-                RecorderStatus::SegmentSaved(p) => self.playlist.push(p.to_string_lossy().to_string()),
+                RecorderStatus::SegmentSaved(p) => self.playlist.push(p),
                 RecorderStatus::SegmentDeleted => { self.playlist.pop(); },
                 RecorderStatus::VideoFinalized(p) => { self.playlist.clear(); self.final_file = Some(p.to_string_lossy().to_string()); },
                 RecorderStatus::Error(e) => self.last_error = Some(format!("Rec: {}", e)),
@@ -120,8 +125,20 @@ impl App for ClipperApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) && !self.is_recording {
              let _ = self.rec_tx.send(RecorderCommand::Undo);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !self.is_recording {
-             let _ = self.rec_tx.send(RecorderCommand::FinalizeVideo("output.mp4".to_string()));
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !self.is_recording && !self.playlist.is_empty() {
+            let file_choice = rfd::FileDialog::new()
+                .add_filter("video", &["mp4"])
+                .set_file_name("vid.mp4")
+                .set_directory("~")
+                .save_file();
+
+            if let Some(path) = file_choice {
+                let output_path_string = path.to_string_lossy().to_string();
+                let clip_paths: Vec<std::path::PathBuf> = self.playlist.iter()
+                    .map(|c| c.video_path.clone())
+                    .collect();
+                let _ = self.rec_tx.send(RecorderCommand::FinalizeVideo(clip_paths, output_path_string));
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -216,25 +233,140 @@ impl ClipperApp {
     }
 
     fn show_running(&mut self, ui: &mut egui::Ui) {
-        if let Some(tex) = &self.texture {
-            ui.add(egui::Image::new(tex).fit_to_exact_size(ui.available_size()));
-        }
+        ui.horizontal(|ui| {
+            if self.is_recording {
+                ui.colored_label(egui::Color32::RED, "RECORDING");
+            } else {
+                ui.label("Idle");
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !self.playlist.is_empty() && !self.is_recording {
+                    if ui.button("Merge").clicked() {
+                        let file_choice = rfd::FileDialog::new().add_filter("video", &["mp4"]).set_file_name("vid.mp4").set_directory(".").save_file();
+                        if let Some(path) = file_choice {
+                            let output_path_string = path.to_string_lossy().to_string();
+                            let clip_paths : Vec<PathBuf> = self.playlist.iter().map(|c| c.video_path.clone()).collect();
+                            let _ = self.rec_tx.send(RecorderCommand::FinalizeVideo(clip_paths, output_path_string));
+                        }
+                    }
+                }
+            });
+        });
+
+        ui.separator();
+        let total_height = ui.available_height();
+        let timeline_height = 150.0;
+        let camera_height = total_height - timeline_height;
+        let camera_rect = ui.allocate_ui(egui::vec2(ui.available_width(), camera_height), |ui| {
+            if let Some(texture) = &self.texture {
+                let size = texture.size_vec2();
+                let aspect = size.x / size.y;
+                let available_w = ui.available_width();
+                let available_h = ui.available_height();
+
+                let (w, h) = if available_w / aspect <= available_h {
+                    (available_w, available_w / aspect)
+                } else {
+                    (available_h * aspect, available_h)
+                };
+
+                ui.centered_and_justified(|ui| {
+                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(w, h)));
+                });
+            }  
+        }).response.rect;
 
         if self.is_recording {
-            ui.put(egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(200.0, 50.0)),
-                   |ui: &mut egui::Ui| ui.heading(egui::RichText::new("REC").color(egui::Color32::RED).strong()));
+            ui.put(egui::Rect::from_min_size(camera_rect.min + egui::vec2(20.0, 20.0), egui::vec2(200.0, 50.0)),
+    |ui: &mut egui::Ui| ui.heading(egui::RichText::new("REC").color(egui::Color32::RED).strong())
+            );
         }
 
-        ui.put(egui::Rect::from_min_size(egui::pos2(20.0, ui.available_height() - 50.0), egui::vec2(300.0, 50.0)),
-               |ui: &mut egui::Ui| ui.colored_label(egui::Color32::WHITE, format!("Clips: {}", self.playlist.len())));
+        ui.put(
+            egui::Rect::from_min_size(camera_rect.left_bottom() + egui::vec2(20.0, -50.0), egui::vec2(300.0, 50.0)),
+            |ui: &mut egui::Ui| ui.colored_label(egui::Color32::WHITE, format!("Clips: {}", self.playlist.len()))
+        );
         
         if let Some(f) = &self.final_file {
-            ui.centered_and_justified(|ui| ui.colored_label(egui::Color32::GREEN, format!("Saved: {}", f)));
+            ui.put(
+                egui::Rect::from_center_size(camera_rect.center(), egui::vec2(400.0, 50.0)),
+                |ui: &mut egui::Ui| ui.colored_label(egui::Color32::GREEN, format!("Saved: {}", f))
+            );
         }
 
         if let Some(e) = &self.last_error {
-            ui.put(egui::Rect::from_min_size(egui::pos2(20.0, ui.available_height() - 100.0), egui::vec2(400.0, 40.0)),
-               |ui: &mut egui::Ui| ui.colored_label(egui::Color32::RED, format!("{}", e)));
+            ui.put(
+                egui::Rect::from_min_size(camera_rect.left_bottom() + egui::vec2(20.0, -100.0), egui::vec2(400.0, 40.0)),
+                |ui: &mut egui::Ui| ui.colored_label(egui::Color32::RED, format!("{}", e))
+            );
         }
+
+        ui.separator();
+        ui.label("Timeline");
+        egui::ScrollArea::horizontal().min_scrolled_height(120.0).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let mut move_from = None;
+                let mut move_to = None;
+                let mut delete_index: Option<usize> = None;
+                for (index, clip) in self.playlist.iter().enumerate() {
+                    let size = egui::vec2(120.0, 90.0);
+                    let item_id = ui.make_persistent_id(index);
+                    let is_being_dragged = self.dragged_item == Some(index);
+                    let response = ui.group(|ui| {
+                        ui.set_min_size(size);
+                        let hover_state = ui.ui_contains_pointer();
+                        let img_source = if hover_state {
+                            format!("file://{}", clip.preview_path.to_string_lossy())
+                        } else {
+                            format!("file://{}", clip.thumb_path.to_string_lossy())
+                        };
+
+                        let img_resp = ui.add(egui::Image::new(img_source).fit_to_exact_size(size).rounding(4.0));
+                        let rect = img_resp.rect;
+                        ui.painter().text(
+                            rect.min + egui::vec2(5.0, 5.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{}", index + 1),
+                            egui::FontId::proportional(20.0),
+                            egui::Color32::WHITE
+                        );
+
+                        if hover_state {
+                            let delete_btn_rect = egui::Rect::from_min_size(rect.max - egui::vec2(25.0, 25.0), egui::vec2(20.0, 20.0));
+                            if ui.put(delete_btn_rect, egui::Button::new("X").small()).clicked() {
+                                delete_index = Some(index);
+                            }
+                        }
+                    }).response;
+
+                    let response = response.interact(egui::Sense::drag());
+                    if response.drag_started() {
+                        self.dragged_item = Some(index);
+                    }
+
+                    if is_being_dragged {
+                        ui.painter().rect_stroke(response.rect, 2.0, egui::Stroke::new(2.0, egui::Color32::YELLOW), egui::StrokeKind::Middle);
+                    }
+
+                    if let Some(dragged_index) = self.dragged_item {
+                        if dragged_index != index && response.hovered() {
+                            move_from = Some(dragged_index);
+                            move_to = Some(index)
+                        }
+                    }
+                }
+
+                if let (Some(from), Some(to)) = (move_from, move_to) {
+                    let item = self.playlist.remove(from);
+                    self.playlist.insert(to, item);
+                    self.dragged_item = Some(to);
+                }
+
+                if ui.input(|i| i.pointer.any_released()) {
+                    self.dragged_item = None;
+                }
+            })
+        });
     }
 }
